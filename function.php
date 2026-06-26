@@ -1,5 +1,3 @@
-#ultramaw
-
 <?php
 $KodeYangSangatPanjang = "";
 $KodeYangSangatPanjang .= "UEQ5";
